@@ -1,14 +1,21 @@
 use crate::ffi::{ProcHandle, PsAddr};
-use nix::errno::Errno::ESRCH;
-use nix::libc::user_regs_struct;
+use nix::libc;
 use nix::unistd::Pid;
-use nix::{libc, sys};
+use nix::sys;
 use std::ffi::{c_long, c_void, CStr};
 use std::ptr;
 
-/// Implementation of /usr/include/proc_service.h
+#[cfg(target_arch = "x86_64")]
+use nix::libc::user_regs_struct;
+#[cfg(target_arch = "x86_64")]
+use nix::errno::Errno::ESRCH;
+
+/// Implementation of `/usr/include/proc_service.h`.
 ///
-/// See more info: http://timetobleed.com/notes-about-an-odd-esoteric-yet-incredibly-useful-library-libthread_db/
+/// libthread_db.so dlopens its enclosing process and resolves these
+/// `ps_*` symbols by name. They are the kernel-poking shims it uses to
+/// reach the inferior. See:
+/// http://timetobleed.com/notes-about-an-odd-esoteric-yet-incredibly-useful-library-libthread_db/
 
 #[allow(unused)]
 #[derive(Debug, PartialEq, Eq)]
@@ -129,6 +136,53 @@ pub unsafe extern "C" fn ps_pdwrite(
     write((*handle).pid, ps_addr, addr, size).into()
 }
 
+// --- Register access -------------------------------------------------
+//
+// libthread_db needs to read/write a thread's general-purpose and
+// floating-point register sets. The kernel API differs by arch:
+//
+//   x86_64:   PTRACE_GETREGS    / PTRACE_SETREGS    (struct user_regs_struct)
+//             PTRACE_GETFPREGS  / PTRACE_SETFPREGS  (struct user_fpregs_struct)
+//
+//   aarch64:  PTRACE_GETREGSET(NT_PRSTATUS=1)  / SETREGSET (struct user_regs_struct)
+//             PTRACE_GETREGSET(NT_FPREGSET=2)  / SETREGSET (struct user_fpsimd_struct)
+//
+// The shape of the buffer libthread_db passes us is whatever
+// `prgregset_t` / `prfpregset_t` resolve to in the host's <sys/procfs.h>,
+// which on glibc maps to `user_regs_struct` / `user_fpregs_struct`
+// (x86_64) or `user_regs_struct` / `user_fpsimd_struct` (aarch64).
+
+#[cfg(target_arch = "aarch64")]
+const NT_PRSTATUS: libc::c_uint = 1;
+#[cfg(target_arch = "aarch64")]
+const NT_FPREGSET: libc::c_uint = 2;
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn ptrace_regset(
+    request: libc::c_uint,
+    note_type: libc::c_uint,
+    lwpid: libc::pid_t,
+    buf: *mut libc::c_void,
+    len: usize,
+) -> PsErr {
+    let mut iov = libc::iovec {
+        iov_base: buf,
+        iov_len: len,
+    };
+    let ret = libc::ptrace(
+        request,
+        lwpid,
+        note_type as usize as *mut libc::c_void,
+        &mut iov as *mut _ as *mut libc::c_void,
+    );
+    if ret < 0 {
+        PsErr::Err
+    } else {
+        PsErr::Ok
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn ps_lgetregs(
     _handle: *mut ProcHandle,
@@ -144,6 +198,23 @@ pub unsafe extern "C" fn ps_lgetregs(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn ps_lgetregs(
+    _handle: *mut ProcHandle,
+    lwpid: libc::pid_t,
+    registers: *mut libc::c_void,
+) -> PsErr {
+    ptrace_regset(
+        libc::PTRACE_GETREGSET,
+        NT_PRSTATUS,
+        lwpid,
+        registers,
+        std::mem::size_of::<libc::user_regs_struct>(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn ps_lsetregs(
     _handle: *mut ProcHandle,
@@ -154,6 +225,23 @@ pub unsafe extern "C" fn ps_lsetregs(
     sys::ptrace::setregs(Pid::from_raw(lwpid), *registers).into()
 }
 
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn ps_lsetregs(
+    _handle: *mut ProcHandle,
+    lwpid: libc::pid_t,
+    registers: *mut libc::c_void,
+) -> PsErr {
+    ptrace_regset(
+        libc::PTRACE_SETREGSET,
+        NT_PRSTATUS,
+        lwpid,
+        registers,
+        std::mem::size_of::<libc::user_regs_struct>(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn ps_lgetfpregs(
     _handle: *mut ProcHandle,
@@ -166,6 +254,23 @@ pub unsafe extern "C" fn ps_lgetfpregs(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn ps_lgetfpregs(
+    _handle: *mut ProcHandle,
+    lwpid: libc::pid_t,
+    registers: *mut libc::c_void,
+) -> PsErr {
+    ptrace_regset(
+        libc::PTRACE_GETREGSET,
+        NT_FPREGSET,
+        lwpid,
+        registers,
+        std::mem::size_of::<libc::user_fpsimd_struct>(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn ps_lsetfpregs(
     _handle: *mut ProcHandle,
@@ -176,6 +281,22 @@ pub unsafe extern "C" fn ps_lsetfpregs(
         -1 => PsErr::Err,
         _ => PsErr::Ok,
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn ps_lsetfpregs(
+    _handle: *mut ProcHandle,
+    lwpid: libc::pid_t,
+    registers: *mut libc::c_void,
+) -> PsErr {
+    ptrace_regset(
+        libc::PTRACE_SETREGSET,
+        NT_FPREGSET,
+        lwpid,
+        registers,
+        std::mem::size_of::<libc::user_fpsimd_struct>(),
+    )
 }
 
 #[no_mangle]
@@ -202,9 +323,11 @@ pub unsafe extern "C" fn ps_pglobal_lookup(
 }
 
 /// Fetch the special per-thread address associated with the given LWP.
-/// This call is only used on a few platforms (most use a normal register).
-/// The meaning of the `int' parameter is machine-dependent.
-/// This implementation only for amd64 arch.
+/// This call is only used on platforms with segment-based TLS (x86 fs/gs);
+/// on aarch64 glibc reads `TPIDR_EL0` directly via the regset interface
+/// and never asks us, but the symbol must still resolve at dlopen time
+/// — provide a `NoFRegs` stub so libthread_db falls back to the
+/// ABI-default path if it ever does call this.
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub unsafe extern "C" fn ps_get_thread_area(
@@ -228,6 +351,17 @@ pub unsafe extern "C" fn ps_get_thread_area(
         Err(ESRCH) => PsErr::BadLID,
         Err(_) => PsErr::Err,
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[no_mangle]
+pub unsafe extern "C" fn ps_get_thread_area(
+    _handle: *mut ProcHandle,
+    _lwpid: libc::pid_t,
+    _idx: i32,
+    _addr: *mut *mut PsAddr,
+) -> PsErr {
+    PsErr::NoFRegs
 }
 
 #[cfg(test)]

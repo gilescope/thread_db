@@ -86,7 +86,6 @@ impl<'a> Process<'a> {
 
     /// Returns process thread with lwpid == pid.
     /// If thread not exists returns generic `TdErr::Err` (unfortunately this behavior is set in thread_db impl).
-    #[cfg(target_arch = "x86_64")]
     pub fn get_thread(&self, pid: Pid) -> Result<Thread> {
         unsafe {
             let mut handle: TdThrHandle = MaybeUninit::zeroed().assume_init();
